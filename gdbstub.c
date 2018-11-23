@@ -38,6 +38,7 @@
 #include "sysemu/kvm.h"
 #include "exec/semihost.h"
 #include "exec/exec-all.h"
+#include "exec/address-spaces.h"
 
 #ifdef CONFIG_USER_ONLY
 #define GDB_ATTACHED "0"
@@ -55,6 +56,16 @@ static inline int target_memory_rw_debug(CPUState *cpu, target_ulong addr,
     }
     return cpu_memory_rw_debug(cpu, addr, buf, len, is_write);
 }
+
+#ifndef CONFIG_USER_ONLY
+static inline int target_physical_memory_rw(hwaddr phys_addr, uint8_t *buf,
+                                            int len, bool is_write)
+{
+    return address_space_rw(&address_space_memory, phys_addr,
+                            MEMTXATTRS_UNSPECIFIED,
+                            buf, len, is_write);
+}
+#endif
 
 /* Return the GDB index for a given vCPU state.
  *
@@ -1013,6 +1024,9 @@ static int gdb_handle_packet(GDBState *s, const char *line_buf)
     char buf[sizeof(mem_buf) + 1 /* trailing NUL */];
     uint8_t *registers;
     target_ulong addr, len;
+#ifndef CONFIG_USER_ONLY
+    hwaddr phys_addr;
+#endif
 
     trace_gdbstub_io_command(line_buf);
 
@@ -1396,6 +1410,54 @@ static int gdb_handle_packet(GDBState *s, const char *line_buf)
             put_packet(s, GDB_ATTACHED);
             break;
         }
+#ifndef CONFIG_USER_ONLY
+        if (strncmp(p,"ReadPhysicalMemory", 18) == 0) {
+            p += 18;
+            phys_addr = strtoull(p, (char **)&p, 16);
+            if (*p == ',')
+                p++;
+            len = strtoull(p, NULL, 16);
+
+            /* memtohex() doubles the required space */
+            if (len > MAX_PACKET_LENGTH / 2) {
+                put_packet (s, "E22");
+                break;
+            }
+
+            if (target_physical_memory_rw(phys_addr, mem_buf, len,
+                                          false) != 0) {
+                put_packet (s, "E14");
+            } else {
+                memtohex(buf, mem_buf, len);
+                put_packet(s, buf);
+            }
+            break;
+        }
+
+        if (strncmp(p,"WritePhysicalMemory", 19) == 0) {
+            p += 19;
+            phys_addr = strtoull(p, (char **)&p, 16);
+            if (*p == ',')
+                p++;
+            len = strtoull(p, (char **)&p, 16);
+            if (*p == ':')
+                p++;
+
+            /* hextomem() reads 2*len bytes */
+            if (len > strlen(p) / 2) {
+                put_packet (s, "E22");
+                break;
+            }
+            hextomem(mem_buf, p, len);
+            if (target_physical_memory_rw(phys_addr, mem_buf, len,
+                                          true) != 0) {
+                put_packet(s, "E14");
+            } else {
+                put_packet(s, "OK");
+            }
+            break;
+        }
+#endif /* !CONFIG_USER_ONLY */
         /* Unrecognised 'q' command.  */
         goto unknown_command;
 
